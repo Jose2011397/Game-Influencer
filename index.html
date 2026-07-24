@@ -1,3 +1,4 @@
+```html
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -190,6 +191,12 @@
         </div>
       </div>
 
+      <!-- Botão para pular influenciador caso ninguém conheça -->
+      <button id="btn-skip-influencer" onclick="voteToSkip()" class="w-full py-2 bg-gray-800/80 hover:bg-gray-700 text-amber-400 border border-amber-500/40 rounded-lg text-xs font-semibold flex items-center justify-center gap-2 transition">
+        <i class="fa-solid fa-question-circle"></i>
+        <span id="btn-skip-text">Não conheço esse influencer (0/0)</span>
+      </button>
+
       <!-- Campo de Resposta (Esboço 3 - Caixa Inferior "Responda aqui") -->
       <div class="space-y-3">
         <div class="relative">
@@ -240,6 +247,712 @@
       getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged 
     } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
+    // Configuração do Firebase
+    const firebaseConfig = {
+      apiKey: "AIzaSyCXvC1ngYClrQQ4twCh7vXG-EecSTV5AbE",
+      authDomain: "game-d9705.firebaseapp.com",
+      projectId: "game-d9705",
+      storageBucket: "game-d9705.firebasestorage.app",
+      messagingSenderId: "145057981783",
+      appId: "1:145057981783:web:7acc0a66c68eb8c4c20a12"
+    };
+
+    const apiKey = "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";
+
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+
+    let authUser = null;
+    let username = "";
+    let roomCode = "";
+    let currentRoomData = null;
+    let roomUnsubscribe = null;
+    let isEvaluating = false;
+
+    // Dica individual do usuário local
+    let userHintIndex = 0;
+    let maxUserHintIndex = 0; // Registra a dica mais avançada desbloqueada na rodada
+    let lastHandledRound = 0;
+
+    function updateStatusUI(online) {
+      const statusEl = document.getElementById('connection-status');
+      if (statusEl) {
+        if (online) {
+          statusEl.className = "mb-3 text-center flex items-center justify-center gap-2 text-xs text-emerald-400 bg-emerald-500/10 py-1.5 px-3 rounded-lg border border-emerald-500/20";
+          statusEl.innerHTML = `<i class="fa-solid fa-wifi text-emerald-400"></i> <span>Online no Firebase</span>`;
+        } else {
+          statusEl.className = "mb-3 text-center flex items-center justify-center gap-2 text-xs text-amber-400 bg-amber-500/10 py-1.5 px-3 rounded-lg border border-amber-500/20";
+          statusEl.innerHTML = `<i class="fa-solid fa-circle-notch animate-spin"></i> <span>Conectando ao Firebase Online...</span>`;
+        }
+      }
+    }
+
+    // Autenticação no Firebase
+    async function initAuth() {
+      if (authUser) return authUser;
+
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          const cred = await signInWithCustomToken(auth, __initial_auth_token);
+          authUser = cred.user;
+        } else {
+          const cred = await signInAnonymously(auth);
+          authUser = cred.user;
+        }
+      } catch (err) {
+        console.warn("Autenticação anônima do Firebase falhou, usando ID de sessão local:", err);
+        let savedUid = localStorage.getItem('game_user_uid');
+        if (!savedUid) {
+          savedUid = 'usr_' + Math.random().toString(36).substring(2, 10);
+          localStorage.setItem('game_user_uid', savedUid);
+        }
+        authUser = { uid: savedUid };
+      }
+      updateStatusUI(true);
+      return authUser;
+    }
+
+    onAuthStateChanged(auth, (user) => {
+      if (user) {
+        authUser = user;
+        updateStatusUI(true);
+      }
+    });
+
+    initAuth();
+
+    function showToast(msg) {
+      const toast = document.getElementById('toast');
+      const toastMsg = document.getElementById('toast-msg');
+      toastMsg.textContent = msg;
+      toast.classList.remove('hidden');
+      setTimeout(() => {
+        toast.classList.add('hidden');
+      }, 3500);
+    }
+
+    function showScreen(screenId) {
+      ['screen-home', 'screen-lobby', 'screen-game', 'screen-gameover'].forEach(id => {
+        document.getElementById(id).classList.add('hidden');
+      });
+      document.getElementById(screenId).classList.remove('hidden');
+    }
+
+    // --- GROQ / GROK API CALL (IA) ---
+    async function callGeminiAPI(prompt, isJson = false) {
+      const url = "https://api.groq.com/openai/v1/chat/completions";
+
+      const payload = {
+        model: "llama-3.3-70b-versatile",
+        messages: [{ role: "user", content: prompt }]
+      };
+
+      if (isJson) {
+        payload.response_format = { type: "json_object" };
+      }
+
+      let delay = 1000;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          const res = await fetch(url, {
+            method: 'POST',
+            headers: { 
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${apiKey}`
+            },
+            body: JSON.stringify(payload)
+          });
+
+          if (res.ok) {
+            const data = await res.json();
+            return data.choices?.[0]?.message?.content;
+          }
+        } catch (e) {}
+        await new Promise(r => setTimeout(r, delay));
+        delay *= 2;
+      }
+      throw new Error("Erro na comunicação com a IA");
+    }
+
+    // Gerar Carta com Influenciador Único por Rodada (Diversificado em várias plataformas brasileiras)
+    async function generateInfluencerCard(usedInfluencers = []) {
+      const prompt = `Escolha um influenciador digital, streamer, criador de conteúdo ou celebridade da internet MUITO famoso no Brasil.
+      Sua escolha NÃO deve ficar limitada a apenas um site/plataforma. Varie entre TikTok, Instagram, Twitch, Podcasts, e-Sports, realities ou YouTube.
+      
+      Exemplos de personalidades brasileiras: Virginia Fonseca, Casimiro, Igão (Podpah), Mumu (Podpah), Vanessa Lopes, Cellbit, Gaules, Whindersson Nunes, Felipe Neto, Carlinhos Maia, Enaldinho, Loud Coringa, Nobru, Alok, Anitta, Deolane Bezerra, Boca Rosa (Bianca Andrade), Gkay, Pedro Loos (Ciência Todo Dia), Lucas Rangel, Blogueirinha, Cocielo, Davi Brito, Mel Maia, Jade Picon, etc.
+      
+      IMPORTANTE: NÃO escolha nenhum destes influenciadores que já foram usados nesta partida: ${JSON.stringify(usedInfluencers)}.
+      
+      Regras para as dicas:
+      - Seja MUITO específico sobre o influenciador.
+      - Inclua obrigatoriamente características físicas marcantes (ex: cor/estilo de cabelo, tatuagens visíveis, porte físico, se usa óculos de armação marcante, altura/estilo de vestir, sotaque ou estilo visual).
+      - NUNCA inclua palavras sobre pontos, números de dicas ou níveis de dificuldade no texto da dica (ex: NÃO escreva 'Dica 1 (50 pts)'). Apenas escreva o texto da dica diretamente.
+      
+      Retorne um JSON estrito no seguinte formato:
+      {
+        "name": "Nome Principal do Influenciador",
+        "aliases": ["apelido1", "outro_nome"],
+        "hint1": "Dica focada em características físicas marcantes e visual exato, misturado com um detalhe específico de comportamento ou rotina.",
+        "hint2": "Dica focada em bordões inconfundíveis, projetos de grande impacto, polêmicas marcantes ou memes virais clássicos em redes sociais.",
+        "hint3": "Dica focada na plataforma de maior destaque, grupo/podcasts, marcas/empresas proprietárias ou cidade/estado natal."
+      }`;
+
+      try {
+        const text = await callGeminiAPI(prompt, true);
+        return JSON.parse(text);
+      } catch (e) {
+        console.error("Erro ao gerar influenciador com IA:", e);
+        const fallbacks = [
+          { 
+            name: "Casimiro", 
+            aliases: ["Cazé"], 
+            hint1: "Corpulento, usa óculos escuros de armação marcante ou óculos de grau, cabelo curto escuro e estilo bem descontraído com camisetas largas.", 
+            hint2: "Famoso pelo bordão 'Meteu essa?', por reagir a pratos gigantescos de comida nas madrugadas e criar a CazéTV.", 
+            hint3: "Um dos maiores streamers do Brasil na Twitch e YouTube, torcedor fanático do Vasco." 
+          },
+          { 
+            name: "Igão", 
+            aliases: ["Igao", "Igão do Podpah", "Igor Cavalari"], 
+            hint1: "Cabelo raspado nas laterais ou nevado no final do ano, estilo streetwear com correntes, tatuagens marcantes nos braços e porte físico alto.", 
+            hint2: "Famoso por coapresentar o maior podcast em vídeo do Brasil e pelas risadas espontâneas durante as entrevistas.", 
+            hint3: "Apresentador do Podpah ao lado do Mítico." 
+          },
+          { 
+            name: "Virginia Fonseca", 
+            aliases: ["Virginia"], 
+            hint1: "Loira, sorriso perfeitamente alinhado, estilo fitness elegante, maquiagem impecável e costuma gravar Stories mostrando seu dia desde as 5h da manhã.", 
+            hint2: "Dona da famosa marca de cosméticos WePink e conhecida pelas dancinhas de divulgação no TikTok dos hits sertanejos.", 
+            hint3: "Apresentadora do programa Sabadou no SBT e uma das maiores influenciadoras de rotina e família do Instagram brasileiro." 
+          },
+          { 
+            name: "Whindersson Nunes", 
+            aliases: ["Whindersson"], 
+            hint1: "Cabelo longo cacheado ou ondulado (às vezes descolorido ou com tranças), várias tatuagens no rosto e corpo, e físico definido por treinos de boxe recentes.", 
+            hint2: "Piauiense de humor afiado que gravava vídeos sem camisa no quarto e lotou estádios com o show de stand-up 'Adulto'.", 
+            hint3: "Tornou-se por anos o maior YouTuber individual de comédia do Brasil." 
+          },
+          { 
+            name: "Loud Coringa", 
+            aliases: ["Coringa", "Victor Augusto"], 
+            hint1: "Visual jovem com tatuagens visíveis no pescoço e braço, corte de cabelo moderno na régua (frequentemente descolorido ou castanho) e estilo esportivo casual.", 
+            hint2: "Famoso por suas Lives de GTA RP (Roleplay), estourar bordões rápidos e seu estilo de vida luxuoso em mansões de e-Sports.", 
+            hint3: "Um dos maiores nomes da organização LOUD e influenciador gigante na Twitch e YouTube." 
+          }
+        ];
+
+        const available = fallbacks.filter(f => !usedInfluencers.includes(f.name));
+        return available.length > 0 ? available[0] : fallbacks[0];
+      }
+    }
+
+    // --- LÓGICA DAS SALAS COM FIRESTORE MULTIPLAYER ---
+
+    // Criar Sala (Host)
+    window.createRoom = async () => {
+      const user = await initAuth();
+      if (!user) {
+        showToast("Conectando ao banco de dados... Tente novamente.");
+        return;
+      }
+
+      const nameInput = document.getElementById('input-username').value.trim();
+      if (!nameInput) {
+        showToast("Digite seu user nome primeiro!");
+        return;
+      }
+
+      username = nameInput;
+      roomCode = Math.floor(1000 + Math.random() * 9000).toString();
+
+      const newRoom = {
+        code: roomCode,
+        hostId: user.uid,
+        status: 'lobby',
+        round: 1,
+        maxRounds: 5,
+        currentInfluencer: null,
+        usedInfluencerNames: [],
+        lastWinner: null,
+        skipVotes: {}, // Registro de votos para pular influencer
+        players: {
+          [user.uid]: {
+            name: username,
+            score: 0,
+            isHost: true
+          }
+        },
+        createdAt: Date.now()
+      };
+
+      try {
+        const roomRef = doc(db, 'rooms', roomCode);
+        await setDoc(roomRef, newRoom);
+        listenToRoom(roomCode);
+      } catch (e) {
+        console.error("Erro ao criar sala:", e);
+        showToast("Erro ao criar sala no Firestore!");
+      }
+    };
+
+    // Entrar na Sala (Participante)
+    window.joinRoom = async () => {
+      const user = await initAuth();
+      if (!user) {
+        showToast("Conectando ao banco de dados... Tente novamente.");
+        return;
+      }
+
+      const nameInput = document.getElementById('input-username').value.trim();
+      const codeInput = document.getElementById('input-room-code').value.trim().toUpperCase();
+
+      if (!nameInput) {
+        showToast("Digite seu user nome primeiro!");
+        return;
+      }
+      if (!codeInput) {
+        showToast("Digite o código da sala!");
+        return;
+      }
+
+      username = nameInput;
+      roomCode = codeInput;
+
+      try {
+        const roomRef = doc(db, 'rooms', roomCode);
+        const docSnap = await getDoc(roomRef);
+
+        if (!docSnap.exists()) {
+          showToast("Sala não encontrada! Verifique o código.");
+          return;
+        }
+
+        const roomData = docSnap.data();
+        if (roomData.status !== 'lobby') {
+          showToast("Esta partida já foi iniciada!");
+          return;
+        }
+
+        const playerKey = `players.${user.uid}`;
+        await updateDoc(roomRef, {
+          [playerKey]: {
+            name: username,
+            score: 0,
+            isHost: false
+          }
+        });
+
+        listenToRoom(roomCode);
+      } catch (e) {
+        console.error("Erro ao entrar na sala:", e);
+        showToast("Erro ao entrar na sala!");
+      }
+    };
+
+    // Escutar Mudanças no Banco em Tempo Real (onSnapshot)
+    function listenToRoom(code) {
+      if (roomUnsubscribe) roomUnsubscribe();
+
+      const roomRef = doc(db, 'rooms', code);
+
+      roomUnsubscribe = onSnapshot(roomRef, (snapshot) => {
+        if (!snapshot.exists()) {
+          showToast("A sala foi encerrada.");
+          backToHome();
+          return;
+        }
+
+        currentRoomData = snapshot.data();
+        updateRoomUI(currentRoomData);
+      }, (err) => {
+        console.error("Erro no Listener da Sala:", err);
+      });
+    }
+
+    // Sincronizar Interface com o Estado da Sala
+    function updateRoomUI(room) {
+      document.getElementById('display-room-code').textContent = room.code;
+
+      if (room.status === 'lobby') {
+        showScreen('screen-lobby');
+        renderLobbyPlayers(room.players);
+
+        const isHost = authUser && room.hostId === authUser.uid;
+        const btnStart = document.getElementById('btn-start-game');
+        if (isHost) {
+          btnStart.classList.remove('hidden');
+        } else {
+          btnStart.classList.add('hidden');
+        }
+      } else if (room.status === 'playing') {
+        showScreen('screen-game');
+        renderGameScreen(room);
+      } else if (room.status === 'finished') {
+        showScreen('screen-gameover');
+        renderGameOver(room);
+      }
+    }
+
+    // Renderizar a Lista de TODOS os Usuários no Lobby
+    function renderLobbyPlayers(players) {
+      const container = document.getElementById('players-list');
+      container.innerHTML = '';
+
+      if (!players) return;
+
+      Object.entries(players).forEach(([uid, player]) => {
+        const item = document.createElement('div');
+        item.className = "flex items-center justify-between bg-gray-800/80 p-3 rounded-lg border border-gray-700/60";
+        item.innerHTML = `
+          <div class="flex items-center gap-3">
+            <div class="w-8 h-8 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-bold text-sm border border-emerald-500/30">
+              ${player.name.charAt(0).toUpperCase()}
+            </div>
+            <span class="font-semibold text-gray-200 text-sm">${player.name} ${uid === authUser?.uid ? '<span class="text-xs text-gray-400">(Você)</span>' : ''}</span>
+          </div>
+          ${player.isHost ? '<span class="text-[10px] bg-emerald-500/20 text-emerald-300 font-bold px-2 py-0.5 rounded border border-emerald-500/30 uppercase">Host</span>' : ''}
+        `;
+        container.appendChild(item);
+      });
+    }
+
+    // Iniciar Partida
+    window.startGame = async () => {
+      if (!currentRoomData || !authUser) return;
+
+      const btnStart = document.getElementById('btn-start-game');
+      btnStart.disabled = true;
+      btnStart.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> Gerando 1ª Pergunta...`;
+
+      const influencer = await generateInfluencerCard([]);
+
+      try {
+        const roomRef = doc(db, 'rooms', roomCode);
+        userHintIndex = 0;
+        maxUserHintIndex = 0;
+        lastHandledRound = 1;
+        await updateDoc(roomRef, {
+          status: 'playing',
+          round: 1,
+          currentInfluencer: influencer,
+          usedInfluencerNames: [influencer.name],
+          lastWinner: null,
+          skipVotes: {}
+        });
+      } catch (e) {
+        console.error("Erro ao iniciar jogo:", e);
+        showToast("Erro ao iniciar partida.");
+      } finally {
+        btnStart.disabled = false;
+        btnStart.innerHTML = `<i class="fa-solid fa-play"></i> iniciar partida`;
+      }
+    };
+
+    // Renderizar Tela do Jogo
+    function renderGameScreen(room) {
+      // Quando muda a rodada, reseta a dica individual e a maior dica alcançada
+      if (room.round !== lastHandledRound) {
+        userHintIndex = 0;
+        maxUserHintIndex = 0;
+        lastHandledRound = room.round;
+        if (room.lastWinner) {
+          showToast(`⚡ ${room.lastWinner.name} acertou primeiro (+${room.lastWinner.pts} pts)! Nova rodada iniciada.`);
+        }
+      }
+
+      document.getElementById('game-round-badge').textContent = `${room.round} / ${room.maxRounds}`;
+
+      const ptsMap = ['50 PTS', '35 PTS', '25 PTS'];
+      // Exibe os pontos equivalentes à dica mais avançada liberada
+      document.getElementById('game-points-badge').textContent = ptsMap[maxUserHintIndex] || '25 PTS';
+
+      document.getElementById('hint-number-title').textContent = `Dica ${userHintIndex + 1} de 3`;
+
+      const influencer = room.currentInfluencer;
+      const hintDisplay = document.getElementById('hint-text-display');
+
+      if (influencer) {
+        if (userHintIndex === 0) hintDisplay.textContent = influencer.hint1;
+        else if (userHintIndex === 1) hintDisplay.textContent = influencer.hint2;
+        else hintDisplay.textContent = influencer.hint3;
+      }
+
+      // Atualiza o estado do botão "Não conheço esse influencer"
+      const totalPlayers = room.players ? Object.keys(room.players).length : 1;
+      const skipVotes = room.skipVotes || {};
+      const currentVotes = Object.keys(skipVotes).length;
+      const hasVoted = authUser && skipVotes[authUser.uid];
+
+      const btnSkipText = document.getElementById('btn-skip-text');
+      const btnSkip = document.getElementById('btn-skip-influencer');
+
+      if (btnSkipText && btnSkip) {
+        btnSkipText.textContent = `Não conheço esse influencer (${currentVotes}/${totalPlayers})`;
+        if (hasVoted) {
+          btnSkip.classList.add('opacity-60', 'bg-amber-950/40');
+          btnSkip.classList.remove('hover:bg-gray-700');
+        } else {
+          btnSkip.classList.remove('opacity-60', 'bg-amber-950/40');
+          btnSkip.classList.add('hover:bg-gray-700');
+        }
+      }
+
+      // Controle dos botões de Dica (Apenas local)
+      const btnPrevHint = document.getElementById('btn-prev-hint');
+      if (btnPrevHint) {
+        if (userHintIndex <= 0) {
+          btnPrevHint.disabled = true;
+          btnPrevHint.classList.add('opacity-50');
+        } else {
+          btnPrevHint.disabled = false;
+          btnPrevHint.classList.remove('opacity-50');
+        }
+      }
+
+      const btnNextHint = document.getElementById('btn-next-hint');
+      if (btnNextHint) {
+        if (userHintIndex >= 2) {
+          btnNextHint.disabled = true;
+          btnNextHint.classList.add('opacity-50');
+        } else {
+          btnNextHint.disabled = false;
+          btnNextHint.classList.remove('opacity-50');
+        }
+      }
+
+      renderScoreboard(room.players);
+    }
+
+    // Renderizar Placar com TODOS os Jogadores na Partida
+    function renderScoreboard(players) {
+      const container = document.getElementById('game-scoreboard');
+      container.innerHTML = '';
+
+      if (!players) return;
+
+      const sorted = Object.entries(players).sort((a, b) => b[1].score - a[1].score);
+
+      sorted.forEach(([uid, p]) => {
+        const isMe = uid === authUser?.uid;
+        const row = document.createElement('div');
+        row.className = `flex items-center justify-between text-xs py-1.5 px-3 rounded-lg border ${isMe ? 'bg-blue-950/60 border-blue-500/50' : 'bg-gray-800/50 border-gray-700/40'}`;
+        row.innerHTML = `
+          <div class="flex items-center gap-2">
+            <span class="font-semibold ${isMe ? 'text-blue-300' : 'text-gray-200'}">${p.name} ${isMe ? '(Você)' : ''}</span>
+          </div>
+          <span class="font-bold text-amber-400 font-mono text-sm">${p.score} pts</span>
+        `;
+        container.appendChild(row);
+      });
+    }
+
+    // Votar para trocar de influenciador caso ninguém o conheça
+    window.voteToSkip = async () => {
+      if (!authUser || !currentRoomData) return;
+
+      const skipVotes = currentRoomData.skipVotes || {};
+
+      if (skipVotes[authUser.uid]) {
+        showToast("Você já votou para pular este influenciador!");
+        return;
+      }
+
+      const updatedVotes = {
+        ...skipVotes,
+        [authUser.uid]: true
+      };
+
+      const totalPlayers = Object.keys(currentRoomData.players || {}).length;
+      const votesCount = Object.keys(updatedVotes).length;
+      const roomRef = doc(db, 'rooms', roomCode);
+
+      // Se TODOS os jogadores votaram para pular
+      if (votesCount >= totalPlayers) {
+        showToast("Todos votaram para pular! Troca de influenciador em andamento...");
+        const usedList = [...(currentRoomData.usedInfluencerNames || []), currentRoomData.currentInfluencer?.name].filter(Boolean);
+        const newInfluencer = await generateInfluencerCard(usedList);
+
+        userHintIndex = 0;
+        maxUserHintIndex = 0;
+
+        await updateDoc(roomRef, {
+          currentInfluencer: newInfluencer,
+          usedInfluencerNames: [...usedList, newInfluencer.name],
+          skipVotes: {}
+        });
+      } else {
+        showToast(`Voto registrado! (${votesCount}/${totalPlayers} jogadores votaram)`);
+        await updateDoc(roomRef, {
+          skipVotes: updatedVotes
+        });
+      }
+    };
+
+    // Voltar Dica (Apenas visual, a maior dica alcançada não diminui)
+    window.requestPrevHint = () => {
+      if (userHintIndex > 0) {
+        userHintIndex--;
+        if (currentRoomData) {
+          renderGameScreen(currentRoomData);
+        }
+      }
+    };
+
+    // Avançar Dica (Atualiza a dica visual e o pico máximo alcançado)
+    window.requestNextHint = () => {
+      if (userHintIndex < 2) {
+        userHintIndex++;
+        if (userHintIndex > maxUserHintIndex) {
+          maxUserHintIndex = userHintIndex;
+        }
+        if (currentRoomData) {
+          renderGameScreen(currentRoomData);
+        }
+      }
+    };
+
+    // Submeter Resposta e Encerrar a Rodada para Todos se for o primeiro a acertar
+    window.submitAnswer = async () => {
+      if (!authUser || !currentRoomData) return;
+
+      const inputEl = document.getElementById('input-answer');
+      const guess = inputEl.value.trim();
+
+      if (!guess) {
+        showToast("Digite sua resposta primeiro!");
+        return;
+      }
+
+      if (isEvaluating) return;
+
+      isEvaluating = true;
+      const btnSend = document.getElementById('btn-send-answer');
+      btnSend.disabled = true;
+      btnSend.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> Avaliando...`;
+
+      try {
+        const influencer = currentRoomData.currentInfluencer;
+        const correctTarget = influencer.name;
+
+        const evalPrompt = `O influenciador correto é "${correctTarget}". Apelidos/nomes conhecidos: ${JSON.stringify(influencer.aliases || [])}.
+        O jogador respondeu: "${guess}".
+        A resposta do jogador está correta (restringindo-se ao influenciador e ignorando erros pequenos de digitação)?
+        Responda exclusivamente em formato JSON estrito: { "isCorrect": true/false }`;
+
+        let isCorrect = false;
+
+        try {
+          const evalResponse = await callGeminiAPI(evalPrompt, true);
+          const evalResult = JSON.parse(evalResponse);
+          isCorrect = evalResult.isCorrect === true;
+        } catch (e) {
+          const cleanGuess = guess.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+          const cleanTarget = correctTarget.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+          isCorrect = cleanGuess.includes(cleanTarget) || cleanTarget.includes(cleanGuess);
+        }
+
+        if (isCorrect) {
+          inputEl.value = '';
+
+          const pointsTable = [50, 35, 25];
+          // A pontuação é calculada com base na dica mais avançada que o jogador já desbloqueou
+          const earned = pointsTable[maxUserHintIndex] || 25;
+
+          const playerKey = `players.${authUser.uid}.score`;
+          const currentScore = currentRoomData.players[authUser.uid]?.score || 0;
+          const newScore = currentScore + earned;
+
+          const roomRef = doc(db, 'rooms', roomCode);
+
+          // Como quem responde primeiro ganha a rodada, avança de rodada imediatamente
+          if (currentRoomData.round >= currentRoomData.maxRounds) {
+            // Fim das 5 rodadas
+            await updateDoc(roomRef, {
+              [playerKey]: newScore,
+              status: 'finished'
+            });
+          } else {
+            // Avança para a próxima rodada com um NOVO influenciador sem repetir
+            showToast(`🎉 Você acertou primeiro e ganhou ${earned} pts! Gerando próxima rodada...`);
+            const usedList = [...(currentRoomData.usedInfluencerNames || []), influencer.name];
+            const nextInfluencer = await generateInfluencerCard(usedList);
+
+            await updateDoc(roomRef, {
+              [playerKey]: newScore,
+              round: currentRoomData.round + 1,
+              currentInfluencer: nextInfluencer,
+              usedInfluencerNames: [...usedList, nextInfluencer.name],
+              lastWinner: {
+                name: username,
+                pts: earned
+              },
+              skipVotes: {}
+            });
+          }
+        } else {
+          showToast("❌ Resposta incorreta! Tente novamente.");
+        }
+      } catch (err) {
+        console.error("Erro ao validar resposta:", err);
+        showToast("Erro ao processar resposta.");
+      } finally {
+        isEvaluating = false;
+        btnSend.disabled = false;
+        btnSend.innerHTML = `<i class="fa-solid fa-paper-plane"></i> ENVIAR`;
+      }
+    };
+
+    // Fim de Jogo (Leaderboard Final)
+    function renderGameOver(room) {
+      const container = document.getElementById('final-leaderboard');
+      container.innerHTML = '';
+
+      if (!room.players) return;
+
+      const sorted = Object.entries(room.players).sort((a, b) => b[1].score - a[1].score);
+
+      sorted.forEach(([uid, p], idx) => {
+        const medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : `#${idx + 1}`;
+        const item = document.createElement('div');
+        item.className = "flex items-center justify-between p-3.5 rounded-lg bg-gray-800/80 border border-gray-700";
+        item.innerHTML = `
+          <div class="flex items-center gap-3">
+            <span class="text-xl font-bold">${medal}</span>
+            <span class="font-semibold text-gray-100">${p.name} ${uid === authUser?.uid ? '(Você)' : ''}</span>
+          </div>
+          <span class="font-bold text-amber-400 font-mono text-lg">${p.score} pts</span>
+        `;
+        container.appendChild(item);
+      });
+    }
+
+    // Copiar código da sala
+    window.copyRoomCode = () => {
+      if (!roomCode) return;
+      const tempInput = document.createElement('input');
+      tempInput.value = roomCode;
+      document.body.appendChild(tempInput);
+      tempInput.select();
+      document.execCommand('copy');
+      document.body.removeChild(tempInput);
+      showToast("Código da sala copiado!");
+    };
+
+    // Voltar para o início
+    window.backToHome = () => {
+      if (roomUnsubscribe) roomUnsubscribe();
+      currentRoomData = null;
+      roomCode = "";
+      userHintIndex = 0;
+      maxUserHintIndex = 0;
+      lastHandledRound = 0;
+      showScreen('screen-home');
+    };
+  </script>
+</body>
+</html>
+
+```
     // Configuração do Firebase
     const firebaseConfig = {
       apiKey: "AIzaSyCXvC1ngYClrQQ4twCh7vXG-EecSTV5AbE",
