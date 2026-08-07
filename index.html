@@ -29,7 +29,7 @@
 
     .sketch-input {
       background: #1f2937;
-      border: 2px solid #3b82f6;
+q      border: 2px solid #3b82f6;
       border-radius: 0.75rem;
       color: #ffffff;
       transition: all 0.2s ease;
@@ -256,7 +256,7 @@
       appId: "1:145057981783:web:7acc0a66c68eb8c4c20a12"
     };
 
-    const apiKey = "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";
+    const apiKey = "AQ.Ab8RN6JDYmjWH0rgAqMT2SxaETQ9U-yv_Xy7Enuf1MrmXuuo_w";
 
     const app = initializeApp(firebaseConfig);
     const auth = getAuth(app);
@@ -343,7 +343,7 @@
       const url = "https://api.groq.com/openai/v1/chat/completions";
 
       const payload = {
-        model: "llama-3.3-70b-versatile",
+        model: "gemini-2.5-flash",
         messages: [{ role: "user", content: prompt }]
       };
 
